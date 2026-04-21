@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: query-to-image-agent
+    runtime: docker
+    autoDeploy: true
+    dockerContext: .
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: KIE_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: PORT
+        value: "10000"
+      - key: PYTHONUNBUFFERED
+        value: "1"
