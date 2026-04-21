@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import time
 from typing import Any
 
@@ -12,10 +14,44 @@ from app.utils.json_utils import extract_first_url
 
 _TRANSIENT_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 _FAILURE_STATES = {"failed", "error", "cancelled", "canceled", "timeout"}
+_SUCCESS_STATES = {"success", "succeeded", "completed", "done"}
+_NON_ERROR_CODES = {"0", "200", "ok", "success"}
+_BEARER_PREFIX_RE = re.compile(r"^\s*bearer\s+", re.IGNORECASE)
 
 
 class _TransientHTTPError(Exception):
     pass
+
+
+def _normalize_api_key(raw_key: str) -> str:
+    # Accept keys pasted as either plain token or "Bearer <token>".
+    return _BEARER_PREFIX_RE.sub("", raw_key).strip()
+
+
+def _get_task_id(payload: dict[str, Any]) -> str | None:
+    data = payload.get("data")
+    data_dict = data if isinstance(data, dict) else {}
+
+    candidates = (
+        data_dict.get("taskId"),
+        data_dict.get("task_id"),
+        data_dict.get("id"),
+        payload.get("taskId"),
+        payload.get("task_id"),
+        payload.get("id"),
+    )
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _compact_payload(payload: Any, limit: int = 400) -> str:
+    try:
+        text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+    except Exception:
+        text = str(payload)
+    return text[:limit]
 
 
 class KieService:
@@ -54,15 +90,13 @@ class KieService:
             json=payload,
         )
 
-        task_id = None
-        if isinstance(response, dict):
-            data = response.get("data")
-            if isinstance(data, dict):
-                task_id = data.get("taskId")
-            task_id = task_id or response.get("taskId")
+        task_id = _get_task_id(response)
 
-        if not task_id or not isinstance(task_id, str):
-            raise KieServiceError("Kie createTask did not return a valid taskId")
+        if not task_id:
+            raise KieServiceError(
+                "Kie createTask did not return a valid task id. "
+                f"Response: {_compact_payload(response)}"
+            )
 
         return task_id
 
@@ -83,9 +117,15 @@ class KieService:
             if not isinstance(data, dict):
                 data = response
 
-            state = str(data.get("state", "")).strip().lower()
-            if state == "success":
-                image_url = extract_first_url(data.get("resultJson")) or extract_first_url(data)
+            state = str(
+                data.get("state") or data.get("status") or data.get("taskStatus") or ""
+            ).strip().lower()
+            if state in _SUCCESS_STATES:
+                image_url = (
+                    extract_first_url(data.get("resultJson"))
+                    or extract_first_url(data.get("result"))
+                    or extract_first_url(data)
+                )
                 if not image_url:
                     raise KieServiceError("Kie task succeeded but image URL was not found")
                 return image_url
@@ -101,7 +141,8 @@ class KieService:
 
     async def _request_json(self, method: str, url: str, **kwargs: Any) -> dict[str, Any]:
         headers = kwargs.pop("headers", {})
-        headers["Authorization"] = f"Bearer {self._settings.kie_api_key}"
+        headers["Authorization"] = f"Bearer {_normalize_api_key(self._settings.kie_api_key)}"
+        headers.setdefault("Content-Type", "application/json")
 
         for attempt in range(1, self._settings.kie_max_retries + 1):
             try:
@@ -120,6 +161,14 @@ class KieService:
 
                 if not isinstance(payload, dict):
                     raise KieServiceError("Kie response JSON root must be an object")
+
+                if "code" in payload:
+                    code = str(payload.get("code", "")).strip().lower()
+                    if code and code not in _NON_ERROR_CODES:
+                        msg = payload.get("msg") or payload.get("message") or payload.get("error")
+                        raise KieServiceError(
+                            f"Kie API returned code={payload.get('code')}: {msg}"
+                        )
 
                 return payload
             except (httpx.RequestError, _TransientHTTPError) as exc:
